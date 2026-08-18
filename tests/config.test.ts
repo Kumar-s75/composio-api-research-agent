@@ -9,6 +9,23 @@ describe("parseEnvironment", () => {
       concurrency: 3,
       dataDirectory: "data",
       outputDirectory: "output",
+      researchRunId: undefined,
+      researchMaxRetries: 2,
+      researchResultGeneratorModule: undefined,
+    });
+  });
+
+  it("treats blank optional .env values as absent", () => {
+    expect(
+      parseEnvironment({
+        COMPOSIO_API_KEY: "",
+        RESEARCH_RUN_ID: "",
+        RESEARCH_RESULT_GENERATOR_MODULE: "",
+      }),
+    ).toMatchObject({
+      composioApiKey: undefined,
+      researchRunId: undefined,
+      researchResultGeneratorModule: undefined,
     });
   });
 });

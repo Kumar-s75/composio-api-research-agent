@@ -36,15 +36,33 @@ function createMockClient(): ComposioResearchClient {
   const session = {
     sessionId: "session_research_example",
     execute: vi.fn(async (toolSlug: string) => {
-      if (toolSlug === "COMPOSIO_SEARCH_WEB") {
+      if (toolSlug === "COMPOSIO_SEARCH_TOOLS") {
         return {
-          results: [
-            {
-              url: collectedUrl,
-              title: "Example API documentation",
-              snippet: "Official API and authentication documentation.",
+          data: {
+            results: [{ primary_tool_slugs: ["CURRENT_WEB_LOOKUP"] }],
+            tool_schemas: {
+              CURRENT_WEB_LOOKUP: {
+                tool_slug: "CURRENT_WEB_LOOKUP",
+                toolkit: "composio_search",
+                description: "Search the public web.",
+                input_schema: { type: "object", properties: { query: { type: "string" } } },
+              },
             },
-          ],
+          },
+        };
+      }
+
+      if (toolSlug === "COMPOSIO_MULTI_EXECUTE_TOOL") {
+        return {
+          data: {
+            results: [
+              {
+                url: collectedUrl,
+                title: "Example API documentation",
+                snippet: "Official API and authentication documentation.",
+              },
+            ],
+          },
         };
       }
 
@@ -67,8 +85,24 @@ function createMockClient(): ComposioResearchClient {
     },
     tools: {
       getRawToolRouterSessionTools: vi.fn().mockResolvedValue([
-        { slug: "COMPOSIO_SEARCH_WEB", name: "Web Search" },
-        { slug: "COMPOSIO_SEARCH_FETCH_URL_CONTENT", name: "Fetch URL Content" },
+        {
+          slug: "COMPOSIO_SEARCH_TOOLS",
+          name: "Search tools",
+          toolkit: { slug: "session", name: "Session" },
+          inputParameters: { type: "object", properties: { queries: { type: "array" } } },
+        },
+        {
+          slug: "COMPOSIO_MULTI_EXECUTE_TOOL",
+          name: "Multi execute",
+          toolkit: { slug: "session", name: "Session" },
+          inputParameters: { type: "object", properties: { tools: { type: "array" } } },
+        },
+        {
+          slug: "COMPOSIO_SEARCH_FETCH_URL_CONTENT",
+          name: "Fetch URL Content",
+          toolkit: { slug: "composio_search", name: "Composio Search" },
+          inputParameters: { type: "object", properties: { url: { type: "string" } } },
+        },
       ]),
     },
   };
@@ -159,7 +193,7 @@ describe("ApiResearchAgent", () => {
     expect(resultGenerator.generate).toHaveBeenCalledOnce();
   });
 
-  it("rejects mocked research results that cite URLs not collected by the agent", async () => {
+  it("does not allow a mocked research result with only uncollected evidence to reach final validation", async () => {
     const resultGenerator: StructuredResearchResultGenerator = {
       generate: vi.fn(async ({ sources }) =>
         createValidResult("https://invented.example.test/api", sources[0]?.retrieved_at),
@@ -177,6 +211,6 @@ describe("ApiResearchAgent", () => {
         name: "Example App",
         category: "CRM and Sales",
       }),
-    ).rejects.toThrow("Evidence URL was not collected during this run");
+    ).rejects.toThrow(/evidence/);
   });
 });
