@@ -104,6 +104,8 @@ export function validateEvidenceCoverage(
     }
   }
 
+  assertAuthenticationEvidence(result, sourceByUrl);
+
   const assessment = assessEvidenceQuality(result);
   for (const field of assessment.missing_fields) {
     throw new Error(`Missing evidence for material claim: ${field}`);
@@ -127,6 +129,119 @@ export function validateEvidenceCoverage(
   }
 
   return assessment;
+}
+
+/**
+ * Retains only citations that exactly match the collected source corpus. Any
+ * discarded model citation is not accepted as evidence; reconciliation will
+ * subsequently demote claims it can no longer support to UNKNOWN.
+ */
+export function retainCollectedEvidence(
+  result: NormalizedResearchResult,
+  collectedSources: readonly CollectedSource[],
+): NormalizedResearchResult {
+  const sourceByUrl = new Map(
+    collectedSources.map((source) => [normalizeUrl(source.url), source]),
+  );
+  const isCollectedEvidence = (item: Evidence): boolean => {
+    const source = sourceByUrl.get(normalizeUrl(item.source_url));
+    return source !== undefined &&
+      item.retrieved_at === source.retrieved_at &&
+      (source.page_title === "UNKNOWN" || item.page_title === "UNKNOWN" || item.page_title === source.page_title) &&
+      (item.source_type !== "search_snippet" || source.origin === "search");
+  };
+
+  return {
+    ...result,
+    evidence: result.evidence.filter(isCollectedEvidence),
+    api: {
+      ...result.api,
+      mcp_evidence: result.api.mcp_evidence.filter(isCollectedEvidence),
+    },
+  };
+}
+
+/**
+ * Removes unsupported certainty before final evidence validation. This is
+ * intentionally conservative: when the collected source corpus does not
+ * support a material field, its canonical UNKNOWN representation is used.
+ */
+export function reconcileEvidenceBackedFindings(
+  result: NormalizedResearchResult,
+  collectedSources: readonly CollectedSource[],
+): NormalizedResearchResult {
+  const sourceByUrl = new Map(
+    collectedSources.map((source) => [normalizeUrl(source.url), source]),
+  );
+  const hasEvidence = (field: Evidence["normalized_field"]): boolean =>
+    result.evidence.some((item) =>
+      item.normalized_field === field && sourceByUrl.has(normalizeUrl(item.source_url)),
+    );
+  const authenticationMethods: NormalizedResearchResult["authentication"]["methods"] = result.authentication.methods.every((method) =>
+    method === "UNKNOWN" ||
+    hasDirectAuthenticationEvidence(result.evidence, sourceByUrl, "authentication.methods", method),
+  )
+    ? result.authentication.methods
+    : ["UNKNOWN"];
+  const authenticationPrimaryMethod =
+    result.authentication.primary_method === "UNKNOWN" ||
+    hasDirectAuthenticationEvidence(
+      result.evidence,
+      sourceByUrl,
+      "authentication.primary_method",
+      result.authentication.primary_method,
+    )
+      ? result.authentication.primary_method
+      : "UNKNOWN";
+  const mcpHasRequiredEvidence =
+    result.api.mcp !== "official" && result.api.mcp !== "community"
+      ? true
+      : result.api.mcp_evidence.length > 0;
+
+  return {
+    ...result,
+    app: {
+      ...result.app,
+      description: hasEvidence("app.description") ? result.app.description : "UNKNOWN",
+    },
+    authentication: {
+      methods: authenticationMethods,
+      primary_method: authenticationPrimaryMethod,
+      notes: hasEvidence("authentication.notes") ? result.authentication.notes : "UNKNOWN",
+    },
+    credential_access: {
+      model: hasEvidence("credential_access.model") ? result.credential_access.model : "UNKNOWN",
+      free: hasEvidence("credential_access.free") ? result.credential_access.free : "UNKNOWN",
+      trial: hasEvidence("credential_access.trial") ? result.credential_access.trial : "UNKNOWN",
+      paid_plan: hasEvidence("credential_access.paid_plan") ? result.credential_access.paid_plan : "UNKNOWN",
+      admin_approval: hasEvidence("credential_access.admin_approval")
+        ? result.credential_access.admin_approval
+        : "UNKNOWN",
+      partner_required: hasEvidence("credential_access.partner_required")
+        ? result.credential_access.partner_required
+        : "UNKNOWN",
+      contact_sales: hasEvidence("credential_access.contact_sales")
+        ? result.credential_access.contact_sales
+        : "UNKNOWN",
+      notes: hasEvidence("credential_access.notes") ? result.credential_access.notes : "UNKNOWN",
+    },
+    api: {
+      ...result.api,
+      documented: hasEvidence("api.documented") ? result.api.documented : "UNKNOWN",
+      types: hasEvidence("api.types") ? result.api.types : ["UNKNOWN"],
+      rest: hasEvidence("api.rest") ? result.api.rest : "UNKNOWN",
+      graphql: hasEvidence("api.graphql") ? result.api.graphql : "UNKNOWN",
+      other: hasEvidence("api.other") ? result.api.other : "UNKNOWN",
+      breadth: hasEvidence("api.breadth") ? result.api.breadth : "UNKNOWN",
+      mcp: hasEvidence("api.mcp") && mcpHasRequiredEvidence ? result.api.mcp : "UNKNOWN",
+    },
+    buildability: {
+      verdict: hasEvidence("buildability.verdict") ? result.buildability.verdict : "UNKNOWN",
+      score: hasEvidence("buildability.score") ? result.buildability.score : "UNKNOWN",
+      blocker: hasEvidence("buildability.blocker") ? result.buildability.blocker : "UNKNOWN",
+      rationale: hasEvidence("buildability.rationale") ? result.buildability.rationale : "UNKNOWN",
+    },
+  };
 }
 
 /** Evaluates evidence coverage and source quality without mutating the research findings. */
@@ -341,4 +456,64 @@ function groupEvidenceByField(evidence: readonly Evidence[]): Map<Evidence["norm
 
 function normalizeClaim(claim: string): string {
   return claim.trim().replaceAll(/\s+/g, " ").toLocaleLowerCase("en-US");
+}
+
+function sourceSupportsAuthenticationMethod(
+  source: CollectedSource,
+  method: NormalizedResearchResult["authentication"]["primary_method"],
+): boolean {
+  const text = `${source.page_title} ${source.summary}`.toLocaleLowerCase("en-US");
+  const patterns: Record<Exclude<NormalizedResearchResult["authentication"]["primary_method"], "UNKNOWN">, RegExp> = {
+    oauth2: /\boauth(?:\s*2(?:\.0)?)?\b|\bopenid connect\b/,
+    api_key: /\bapi[ _-]?key\b|\baccess token\b/,
+    basic_auth: /\bbasic auth(?:entication)?\b/,
+    bearer_token: /\bbearer token\b/,
+    service_account: /\bservice account\b/,
+    jwt: /\bjson web token\b|\bjwt\b/,
+    custom: /\bcustom auth(?:entication)?\b/,
+    none: /\bno auth(?:entication)?\b|\bwithout auth(?:entication)?\b|\bdoes not require auth(?:entication)?\b/,
+  };
+  return method !== "UNKNOWN" && patterns[method].test(text);
+}
+
+function assertAuthenticationEvidence(
+  result: NormalizedResearchResult,
+  sourceByUrl: ReadonlyMap<string, CollectedSource>,
+): void {
+  for (const method of result.authentication.methods) {
+    if (
+      method !== "UNKNOWN" &&
+      !hasDirectAuthenticationEvidence(result.evidence, sourceByUrl, "authentication.methods", method)
+    ) {
+      throw new Error(`Missing direct evidence for authentication.methods: ${method}`);
+    }
+  }
+  if (
+    result.authentication.primary_method !== "UNKNOWN" &&
+    !hasDirectAuthenticationEvidence(
+      result.evidence,
+      sourceByUrl,
+      "authentication.primary_method",
+      result.authentication.primary_method,
+    )
+  ) {
+    throw new Error(
+      `Missing direct evidence for authentication.primary_method: ${result.authentication.primary_method}`,
+    );
+  }
+}
+
+function hasDirectAuthenticationEvidence(
+  evidence: readonly Evidence[],
+  sourceByUrl: ReadonlyMap<string, CollectedSource>,
+  field: "authentication.methods" | "authentication.primary_method",
+  method: NormalizedResearchResult["authentication"]["primary_method"],
+): boolean {
+  return evidence.some((item) => {
+    if (item.normalized_field !== field) {
+      return false;
+    }
+    const source = sourceByUrl.get(normalizeUrl(item.source_url));
+    return source !== undefined && sourceSupportsAuthenticationMethod(source, method);
+  });
 }
