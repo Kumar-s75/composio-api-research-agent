@@ -179,6 +179,12 @@ const researchMetadataSchema = z
     researched_at: z.string().datetime({ offset: true }),
     sources_consulted: z.array(z.string().url()),
     confidence: confidenceSchema,
+    composio_search: z.object({
+      tool_slug: z.string().min(1),
+      toolkit: z.string().min(1),
+      discovered_via: z.enum(["direct_session_tool", "COMPOSIO_SEARCH_TOOLS"]),
+      schema_lookup_required: z.boolean(),
+    }).strict().optional(),
   })
   .strict();
 
@@ -202,6 +208,132 @@ export const normalizedResearchResultSchema = z
     verification: verificationSchema,
   })
   .strict();
+
+/**
+ * Strict Structured Outputs requires every emitted object property to be
+ * required. Composio search provenance is added by the pipeline after LLM
+ * generation, so this schema omits only that optional canonical field.
+ */
+
+const llmEvidenceSchema = evidenceSchema.extend({
+  source_url: z.string().min(1),
+});
+
+const llmApiSchema = z
+  .object({
+    documented: availabilitySchema,
+    types: z.array(apiTypeSchema).min(1),
+    rest: availabilitySchema,
+    graphql: availabilitySchema,
+    other: availabilitySchema,
+    breadth: apiBreadthSchema,
+    mcp: mcpStatusSchema,
+    mcp_evidence: z.array(llmEvidenceSchema),
+  })
+  .strict();
+
+const llmResearchMetadataSchema = researchMetadataSchema.omit({
+  composio_search: true,
+});
+
+export const llmNormalizedResearchResultSchema = normalizedResearchResultSchema
+  .omit({
+    research_metadata: true,
+    evidence: true,
+    api: true,
+  })
+  .extend({
+    api: llmApiSchema,
+    evidence: z.array(llmEvidenceSchema).min(1),
+    research_metadata: llmResearchMetadataSchema,
+  })
+  .strict();    
+  
+  
+
+/**
+ * Renders the canonical Zod schema as a concise, JSON-shaped contract for the
+ * synthesis prompt. Keeping this adjacent to the validator prevents the LLM
+ * contract from silently drifting from the enforcement boundary.
+ */
+export function renderNormalizedResearchResultPromptContract(): string {
+  return [
+    "All displayed keys are required unless marked optional. All objects are strict: do not add keys.",
+    "Use the literal string UNKNOWN only where the contract below includes it; never use null.",
+    "For values derived from sources, use the exact URL and retrieved_at timestamp from the collected-source list.",
+    "Contract:",
+    renderZodContract(normalizedResearchResultSchema, 0),
+    "Additional validation: api.mcp of official or community requires at least one api.mcp_evidence item.",
+  ].join("\n");
+}
+
+function renderZodContract(schema: z.ZodTypeAny, depth: number): string {
+  if (schema instanceof z.ZodEffects) {
+    return renderZodContract(schema.innerType(), depth);
+  }
+  if (schema instanceof z.ZodObject) {
+    const indentation = "  ".repeat(depth);
+    const childIndentation = "  ".repeat(depth + 1);
+    const fields = Object.entries(schema.shape).map(([key, value]) => {
+      const optional = value instanceof z.ZodOptional;
+      const fieldSchema = optional ? value.unwrap() : value;
+      return `${childIndentation}${JSON.stringify(key)}${optional ? " (optional)" : ""}: ${renderZodContract(fieldSchema, depth + 1)}`;
+    });
+    return `{\n${fields.join(",\n")}\n${indentation}}`;
+  }
+  if (schema instanceof z.ZodArray) {
+    const minimum = schema._def.minLength?.value;
+    const minimumDescription = minimum === undefined ? "" : `; at least ${minimum} item${minimum === 1 ? "" : "s"}`;
+    return `array of ${renderZodContract(schema.element, depth)}${minimumDescription}`;
+  }
+  if (schema instanceof z.ZodEnum) {
+    return schema.options.map((value: string) => JSON.stringify(value)).join(" | ");
+  }
+  if (schema instanceof z.ZodUnion) {
+    return schema.options.map((option: z.ZodTypeAny) => renderZodContract(option, depth)).join(" | ");
+  }
+  if (schema instanceof z.ZodLiteral) {
+    return JSON.stringify(schema.value);
+  }
+  if (schema instanceof z.ZodString) {
+    return describeString(schema);
+  }
+  if (schema instanceof z.ZodNumber) {
+    return describeNumber(schema);
+  }
+  if (schema instanceof z.ZodBoolean) {
+    return "boolean";
+  }
+  return `unsupported Zod type (${schema._def.typeName})`;
+}
+
+function describeString(schema: z.ZodString): string {
+  const constraints: string[] = [];
+  for (const check of schema._def.checks) {
+    if (check.kind === "min") {
+      constraints.push(`min length ${check.value}`);
+    } else if (check.kind === "url") {
+      constraints.push("URL");
+    } else if (check.kind === "datetime") {
+      constraints.push("ISO 8601 datetime with offset");
+    }
+  }
+  return constraints.length === 0 ? "string" : `string (${constraints.join(", ")})`;
+}
+
+function describeNumber(schema: z.ZodNumber): string {
+  const constraints: string[] = [];
+  for (const check of schema._def.checks) {
+    if (check.kind === "int") {
+      constraints.push("integer");
+    } else if (check.kind === "min") {
+      constraints.push(`minimum ${check.value}`);
+    } else if (check.kind === "max") {
+      constraints.push(`maximum ${check.value}`);
+    }
+  }
+  return constraints.length === 0 ? "number" : `number (${constraints.join(", ")})`;
+}
 
 export type NormalizedResearchResult = z.infer<typeof normalizedResearchResultSchema>;
 export type Evidence = z.infer<typeof evidenceSchema>;
