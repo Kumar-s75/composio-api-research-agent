@@ -1,0 +1,37 @@
+{
+  "name": "composio-100-app-research",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Evidence-backed research and verification pipeline for 100 applications.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "npm run typecheck && npm test",
+    "dev": "tsx src/index.ts",
+    "research": "npm run build && node dist/cli/research.js all",
+    "research:single": "npm run build && node dist/cli/research.js single",
+    "research:resume": "npm run build && node dist/cli/research.js resume",
+    "composio:preflight": "npm run build && node dist/cli/composio-preflight.js",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@composio/core": "^0.14.1",
+    "dotenv": "^16.4.7",
+    "openai": "^7.4.0",
+    "p-limit": "^6.2.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.5",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}
