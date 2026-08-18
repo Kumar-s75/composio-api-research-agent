@@ -2,7 +2,9 @@ import type { ComposioResearchClient, ComposioResearchSession } from "../config/
 import {
   extractCollectedSources,
   hasUnknownFindings,
+  reconcileEvidenceBackedFindings,
   rankSourcesForInspection,
+  retainCollectedEvidence,
   validateEvidenceCoverage,
   type CollectedSource,
 } from "../research/evidence-extractor.js";
@@ -13,16 +15,18 @@ import {
   type SearchQuery,
 } from "../research/search-strategy.js";
 import {
-  createResearchSession,
-  discoverResearchTools,
-  getResearchSessionTools,
-} from "../research/composio-tools.js";
+  executeSearchTool,
+  preflightResearchCapabilities,
+  requireSearchCapability,
+  type ResearchCapabilityReport,
+  type SelectedResearchTool,
+} from "../research/composio-preflight.js";
+import {
+  scoreBuildability,
+  type DeterministicBuildabilityAssessment,
+} from "../scoring/buildability.js";
 import { normalizedResearchResultSchema, type NormalizedResearchResult } from "../types/research-result.js";
 import { buildResearchSynthesisPrompt, researchPromptVersion } from "./prompts.js";
-
-const webSearchToolSlugs = ["COMPOSIO_SEARCH_WEB", "COMPOSIO_SEARCH_DUCK_DUCK_GO"] as const;
-const fetchUrlContentToolSlug = "COMPOSIO_SEARCH_FETCH_URL_CONTENT";
-const browserTaskToolSlug = "BROWSER_TOOL_CREATE_TASK";
 
 export interface StructuredResearchResultGenerator {
   generate(input: {
@@ -40,10 +44,18 @@ export interface ApiResearchAgentOptions {
   maxFetchedSources?: number;
 }
 
+/** Raw model output and collected sources are retained alongside the normalized finding. */
+export interface ResearchArtifact {
+  rawResearch: unknown;
+  collectedSources: readonly CollectedSource[];
+  normalizedResearch: NormalizedResearchResult;
+  deterministicBuildability: DeterministicBuildabilityAssessment;
+  capabilityReport: ResearchCapabilityReport;
+}
+
 interface ResearchToolAvailability {
-  webSearchToolSlug: string;
-  canFetchUrlContent: boolean;
-  canUseBrowser: boolean;
+  searchTool: SelectedResearchTool;
+  fetchTool: SelectedResearchTool | undefined;
 }
 
 /**
@@ -65,11 +77,17 @@ export class ApiResearchAgent {
   }
 
   public async research(application: unknown): Promise<NormalizedResearchResult> {
+    return (await this.researchWithArtifact(application)).normalizedResearch;
+  }
+
+  public async researchWithArtifact(application: unknown): Promise<ResearchArtifact> {
     const app = researchAppSchema.parse(application);
-    const session = await createResearchSession(this.options.client, {
-      userId: `research-${app.id}`,
-    });
-    const availability = await this.getToolAvailability(session);
+    const preflight = await preflightResearchCapabilities(this.options.client, `research-${app.id}`);
+    const session = preflight.session;
+    const availability: ResearchToolAvailability = {
+      searchTool: requireSearchCapability(preflight.report),
+      fetchTool: preflight.report.selectedFetchTool,
+    };
     const strategy = createSearchStrategy(app);
     let collectedSources: CollectedSource[] = [];
     let lastError: unknown;
@@ -77,34 +95,48 @@ export class ApiResearchAgent {
     for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
       const queries = attempt === 1 ? strategy.initial : strategy.fallback;
       try {
-        const searchSources = await this.runSearches(session, availability.webSearchToolSlug, queries);
+        const searchSources = await this.runSearches(session, availability.searchTool, queries);
         collectedSources = mergeSources(collectedSources, searchSources);
 
-        if (availability.canFetchUrlContent) {
-          const fetchedSources = await this.fetchPreferredSources(session, collectedSources);
+        if (availability.fetchTool !== undefined) {
+          const fetchedSources = await this.fetchPreferredSources(session, availability.fetchTool, collectedSources);
           collectedSources = mergeSources(collectedSources, fetchedSources);
         }
 
-        if (attempt > 1 && availability.canUseBrowser) {
-          const browserSources = await this.inspectWithBrowser(session, collectedSources);
-          collectedSources = mergeSources(collectedSources, browserSources);
-        }
-
-        const candidate = normalizedResearchResultSchema.parse(
-          await this.options.resultGenerator.generate({
-            prompt: buildResearchSynthesisPrompt(app, collectedSources),
-            app,
-            sources: collectedSources,
-            promptVersion: researchPromptVersion,
-          }),
+        const rawResearch = await this.options.resultGenerator.generate({
+          prompt: buildResearchSynthesisPrompt(app, collectedSources),
+          app,
+          sources: collectedSources,
+          promptVersion: researchPromptVersion,
+        });
+        const candidate = withComposioSearchMetadata(
+          normalizedResearchResultSchema.parse(rawResearch),
+          availability.searchTool,
         );
 
         assertAppIdentity(candidate, app);
-        const evidenceAssessment = validateEvidenceCoverage(candidate, collectedSources);
-        const assessedCandidate = applyEvidenceConfidence(candidate, evidenceAssessment.should_mark_low_confidence);
+        const sourceBoundCandidate = retainCollectedEvidence(candidate, collectedSources);
+        const evidenceBackedCandidate = normalizedResearchResultSchema.parse(
+          reconcileEvidenceBackedFindings(sourceBoundCandidate, collectedSources),
+        );
+        const evidenceAssessment = validateEvidenceCoverage(evidenceBackedCandidate, collectedSources);
+        const assessedCandidate = applyEvidenceConfidence(
+          evidenceBackedCandidate,
+          evidenceAssessment.should_mark_low_confidence,
+        );
 
         if (!hasUnknownFindings(assessedCandidate) || attempt === this.maxAttempts) {
-          return assessedCandidate;
+          const deterministicBuildability = scoreBuildability(assessedCandidate);
+          return {
+            rawResearch,
+            collectedSources,
+            normalizedResearch: applyDeterministicBuildability(
+              assessedCandidate,
+              deterministicBuildability,
+            ),
+            deterministicBuildability,
+            capabilityReport: preflight.report,
+          };
         }
       } catch (error: unknown) {
         lastError = error;
@@ -119,34 +151,15 @@ export class ApiResearchAgent {
       : new Error("Research agent exhausted its bounded retry limit.");
   }
 
-  private async getToolAvailability(session: ComposioResearchSession): Promise<ResearchToolAvailability> {
-    const rawTools = await getResearchSessionTools(this.options.client, session);
-    const slugs = new Set(rawTools.map((tool) => tool.slug));
-    const webSearchToolSlug = webSearchToolSlugs.find((slug) => slugs.has(slug));
-
-    if (webSearchToolSlug === undefined) {
-      throw new Error("The Composio research session does not expose a web-search tool.");
-    }
-
-    // Session search discovers other suitable tools and keeps tool selection session-scoped.
-    await discoverResearchTools(session, "web search, fetch URL content, and browser interaction");
-
-    return {
-      webSearchToolSlug,
-      canFetchUrlContent: slugs.has(fetchUrlContentToolSlug),
-      canUseBrowser: slugs.has(browserTaskToolSlug),
-    };
-  }
-
   private async runSearches(
     session: ComposioResearchSession,
-    webSearchToolSlug: string,
+    searchTool: SelectedResearchTool,
     queries: readonly SearchQuery[],
   ): Promise<CollectedSource[]> {
     const sources: CollectedSource[] = [];
 
     for (const query of queries) {
-      const response = await session.execute(webSearchToolSlug, { query: query.query });
+      const response = await executeSearchTool(session, searchTool, query.query);
       sources.push(...extractCollectedSources(response, { origin: "search" }));
     }
 
@@ -155,38 +168,38 @@ export class ApiResearchAgent {
 
   private async fetchPreferredSources(
     session: ComposioResearchSession,
+    fetchTool: SelectedResearchTool,
     sources: readonly CollectedSource[],
   ): Promise<CollectedSource[]> {
     const selectedSources = rankSourcesForInspection(sources).slice(0, this.maxFetchedSources);
     const fetchedSources: CollectedSource[] = [];
 
     for (const source of selectedSources) {
-      const response = await session.execute(fetchUrlContentToolSlug, { url: source.url });
+      const response = await session.execute(fetchTool.slug, { [fetchTool.parameterName]: source.url });
       fetchedSources.push(...extractCollectedSources(response, { origin: "fetch" }));
     }
 
     return fetchedSources;
   }
 
-  private async inspectWithBrowser(
-    session: ComposioResearchSession,
-    sources: readonly CollectedSource[],
-  ): Promise<CollectedSource[]> {
-    const source = rankSourcesForInspection(sources)[0];
-    if (source === undefined) {
-      return [];
-    }
+}
 
-    try {
-      const response = await session.execute(browserTaskToolSlug, {
-        task: `Open ${source.url} and return the page title and relevant developer API, authentication, pricing, or MCP information.`,
-      });
-      return extractCollectedSources(response, { origin: "browser" });
-    } catch {
-      // Browser availability is optional; do not turn an unavailable browser into a negative app claim.
-      return [];
-    }
-  }
+function withComposioSearchMetadata(
+  result: NormalizedResearchResult,
+  searchTool: SelectedResearchTool,
+): NormalizedResearchResult {
+  return {
+    ...result,
+    research_metadata: {
+      ...result.research_metadata,
+      composio_search: {
+        tool_slug: searchTool.slug,
+        toolkit: searchTool.toolkitSlug,
+        discovered_via: searchTool.discoveredVia,
+        schema_lookup_required: searchTool.schemaLookupRequired,
+      },
+    },
+  };
 }
 
 function validateBoundedLimit(value: number, name: string, maximum: number): number {
@@ -228,6 +241,33 @@ function applyEvidenceConfidence(
     research_metadata: {
       ...result.research_metadata,
       confidence: "low",
+    },
+  };
+}
+
+function applyDeterministicBuildability(
+  result: NormalizedResearchResult,
+  assessment: DeterministicBuildabilityAssessment,
+): NormalizedResearchResult {
+  const verdict = {
+    EASY: "buildable",
+    MODERATE: "partially_buildable",
+    DIFFICULT: "not_buildable",
+    BLOCKED: "not_buildable",
+    UNKNOWN: "UNKNOWN",
+  } as const;
+  const rationale =
+    assessment.score === "UNKNOWN"
+      ? "Deterministic buildability scoring could not establish a documented public API."
+      : `Deterministic score ${assessment.score}/10: ${assessment.reasons.join(", ") || "no supported factors"}.`;
+
+  return {
+    ...result,
+    buildability: {
+      verdict: verdict[assessment.verdict],
+      score: assessment.score === "UNKNOWN" ? "UNKNOWN" : assessment.score,
+      blocker: assessment.blocker,
+      rationale,
     },
   };
 }
