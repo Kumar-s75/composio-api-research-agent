@@ -26,3 +26,10 @@ export {
   verificationStatusSchema,
 } from "./research-result.js";
 export type { Evidence, NormalizedResearchResult } from "./research-result.js";
+export {
+  deterministicBuildabilityAssessmentSchema,
+  deterministicBuildabilityBlockerSchema,
+  deterministicBuildabilityReasonSchema,
+  deterministicBuildabilityVerdictSchema,
+} from "../scoring/buildability.js";
+export type { DeterministicBuildabilityAssessment } from "../scoring/buildability.js";
