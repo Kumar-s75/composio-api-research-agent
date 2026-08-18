@@ -1,7 +1,8 @@
 import type { CollectedSource } from "../research/evidence-extractor.js";
 import type { ResearchApp } from "../research/search-strategy.js";
+import { renderNormalizedResearchResultPromptContract } from "../types/research-result.js";
 
-export const researchPromptVersion = "v1";
+export const researchPromptVersion = "v2";
 
 export function buildResearchSynthesisPrompt(
   app: ResearchApp,
@@ -14,7 +15,9 @@ Application:
 - name: ${app.name}
 - category: ${app.category}
 
-Return only a JSON object matching the normalized research-result schema. Do not add markdown or commentary.
+Return only a JSON object matching this exact contract. Do not add markdown or commentary.
+
+${renderNormalizedResearchResultPromptContract()}
 
 Research rules:
 - Use only the collected sources below. Never invent a URL, title, quote, API capability, pricing/access condition, or MCP claim.
