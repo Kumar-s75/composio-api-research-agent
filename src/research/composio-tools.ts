@@ -22,17 +22,9 @@ export const researchSessionConfig = {
 } satisfies ToolRouterCreateSessionConfig;
 
 export const researchCapabilities = {
-  web_search: {
-    toolkit: "composio_search",
-    toolSlugs: ["COMPOSIO_SEARCH_WEB", "COMPOSIO_SEARCH_DUCK_DUCK_GO"],
-  },
-  fetch_url_content: {
-    toolkit: "composio_search",
-    toolSlugs: ["COMPOSIO_SEARCH_FETCH_URL_CONTENT"],
-  },
   discover_research_tools: {
     toolkit: "session",
-    toolSlugs: [],
+    toolSlugs: ["COMPOSIO_SEARCH_TOOLS"],
   },
   browser_interaction_when_available: {
     toolkit: "browser_tool",
